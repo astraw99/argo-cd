@@ -145,6 +145,65 @@ func TestHandleModEvent_NoChanges(_ *testing.T) {
 	})
 }
 
+// TestHandleModEvent_ServerChangedWithEqualConfig_ForcesRebuild reproduces a cluster secret
+// server-address swap: two cluster secrets exchange their `server` field while keeping their own
+// credentials unchanged. liveStateCache indexes cached clusters by server URL, so after the swap
+// the entry found at newCluster.Server was actually built for a *different, unrelated* cluster
+// that previously owned this server URL. Before this fix, handleModEvent only compared
+// oldCluster.Config against newCluster.Config to decide whether to refresh - but oldCluster is
+// the cluster being updated itself, which has no relationship with whatever is cached at
+// newCluster.Server. When a cluster's own Config happens to be unchanged across the server swap
+// (the common case: only `server` changed, credentials did not), that comparison is always
+// trivially "equal", so the stale entry - still holding a different cluster's REST config/
+// credentials - was never refreshed and kept being served to Applications under the new server
+// URL indefinitely (manifesting as "the server has asked for the client to provide credentials"
+// errors that never self-heal).
+func TestHandleModEvent_ServerChangedWithEqualConfig_ForcesRebuild(t *testing.T) {
+	t.Parallel()
+	// clusterB's own credentials (`Config`) are intentionally identical to what will be sent as
+	// clusterA's "newCluster.Config" below, to simulate the trivial-DeepEqual-match pitfall: the
+	// bug is specifically that a naive comparison against oldCluster can accidentally look
+	// "unchanged" even though the cache entry actually belongs to a different cluster.
+	sharedConfig := appv1.ClusterConfig{Username: "cluster-a-credentials"}
+
+	// Invalidate(...) is called synchronously inside handleModEvent, so asserting it ran with
+	// mocks.NewClusterCache(t) (which registers t.Cleanup(AssertExpectations)) deterministically
+	// fails the test if the stale entry is left untouched - which is exactly what happened before
+	// this fix, since oldCluster.Config == newCluster.Config made the old code skip the refresh
+	// entirely. EnsureSynced is fired from a background goroutine and is not essential to what
+	// this test verifies, so it is left as .Maybe() to avoid flakiness.
+	staleEntryOwnedByClusterB := mocks.NewClusterCache(t)
+	staleEntryOwnedByClusterB.EXPECT().Invalidate(mock.Anything, mock.Anything, mock.Anything).Return().Once()
+	staleEntryOwnedByClusterB.EXPECT().EnsureSynced().Return(nil).Maybe()
+	staleEntryOwnedByClusterB.EXPECT().GetClusterInfo().Return(cache.ClusterInfo{}).Maybe()
+
+	db := &dbmocks.ArgoDB{}
+	db.EXPECT().GetApplicationControllerReplicas().Return(1).Maybe()
+
+	clustersCache := liveStateCache{
+		clusters: map[string]cache.ClusterCache{
+			// "https://cluster-b" currently holds clusterB's own cache entry. After clusterA's
+			// secret is updated to point at this same server URL (the swap), this entry must be
+			// rebuilt for clusterA, not left alone just because clusterA's Config/oldCluster.Config
+			// happen to be DeepEqual.
+			"https://cluster-b": staleEntryOwnedByClusterB,
+		},
+		clusterSharding: sharding.NewClusterSharding(db, 0, 1, common.DefaultShardingAlgorithm),
+	}
+
+	clustersCache.handleModEvent(&appv1.Cluster{
+		Server:     "https://cluster-a",
+		Config:     sharedConfig,
+		Namespaces: []string{"default"},
+	}, &appv1.Cluster{
+		Server:     "https://cluster-b", // clusterA's server changed to what used to be clusterB's.
+		Config:     sharedConfig,        // clusterA's own credentials are unchanged...
+		Namespaces: []string{"default"}, // ...and so are all its other settings: without checking
+		// serverChanged, every single DeepEqual comparison below would report "unchanged" and
+		// the stale entry inherited from clusterB would be left untouched.
+	})
+}
+
 func TestHandleAddEvent_ClusterExcluded(t *testing.T) {
 	t.Parallel()
 	db := &dbmocks.ArgoDB{}
